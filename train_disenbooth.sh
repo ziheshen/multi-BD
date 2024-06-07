@@ -1,14 +1,16 @@
-export MODEL_NAME="stabilityai/stable-diffusion-2-1-base"
-# export MODEL_NAME="runwayml/stable-diffusion-v1-5"
+# export MODEL_NAME="stabilityai/stable-diffusion-2-1-base"
+export MODEL_NAME="runwayml/stable-diffusion-v1-5"
+export PRETRAINED_BLIP_DIFFUSION="https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP-Diffusion/blip-diffusion.tar.gz"
 export INSTANCE_DIR="/LAVIS/data/mit_mascot"
 export OUTPUT_DIR="./output/test"
 
-accelerate launch train_disenbooth.py \
+accelerate launch train.py \
   --pretrained_model_name_or_path=$MODEL_NAME  \
+  --pretrained_BLIPdiffusion_name_or_path=$PRETRAINED_BLIP_DIFFUSION \
   --instance_data_dir=$INSTANCE_DIR \
   --output_dir=$OUTPUT_DIR \
-  --instance_prompt="a mit_mascot" \
-  --resolution=224 \
+  --subject_text="a mit_mascot" \
+  --resolution=1024 \
   --train_batch_size=1 \
   --gradient_accumulation_steps=1 \
   --checkpointing_steps=200 \
