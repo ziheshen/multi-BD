@@ -59,6 +59,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from lavis.models.blip2_models.blip2_qformer import Blip2Qformer
 from lavis.models.blip_diffusion_models.modeling_ctx_clip import CtxCLIPTextModel
 from multi_BD import MultiBlipDisenBooth
+from dataset import SubjectDrivenTextToImageDataset
 from transformers.activations import QuickGELUActivation as QuickGELU
 from utils import parse_args
 
@@ -201,6 +202,14 @@ def train(args):
         eps=args.adam_epsilon,
     )
 
+    logging.info("Building datasets...")
+    train_dataset = SubjectDrivenTextToImageDataset(
+        image_dir=args.instance_data_dir,
+        subject_text=args.subject_text,
+        text_prompt=args.text_prompt,
+    )
+
+    
 
 if __name__ == "__main__":
     args = parse_args()
