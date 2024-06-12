@@ -44,28 +44,29 @@ class ProjLayer(nn.Module):
         super().__init__()
 
         # Dense1 -> Act -> Dense2 -> Drop -> Res -> Norm
-        # self.dense1 = nn.Linear(in_dim, hidden_dim)
-        # self.act_fn = QuickGELU()
-        # self.dense2 = nn.Linear(hidden_dim, out_dim)
-        # self.dropout = nn.Dropout(drop_p)
-
-        # self.LayerNorm = nn.LayerNorm(out_dim, eps=eps)
-        self.dense_in = nn.Linear(in_dim, out_dim)
-        self.dense1 = nn.Linear(out_dim, hidden_dim)
+        self.dense1 = nn.Linear(in_dim, hidden_dim)
         self.act_fn = QuickGELU()
         self.dense2 = nn.Linear(hidden_dim, out_dim)
         self.dropout = nn.Dropout(drop_p)
+
         self.LayerNorm = nn.LayerNorm(out_dim, eps=eps)
 
-    def forward(self, x):
-        # x_in = x
+        # self.dense_in = nn.Linear(in_dim, out_dim)
+        # self.dense1 = nn.Linear(out_dim, hidden_dim)
+        # self.act_fn = QuickGELU()
+        # self.dense2 = nn.Linear(hidden_dim, out_dim)
+        # self.dropout = nn.Dropout(drop_p)
+        # self.LayerNorm = nn.LayerNorm(out_dim, eps=eps)
 
-        # x = self.LayerNorm(x)
-        # x = self.dropout(self.dense2(self.act_fn(self.dense1(x)))) + x_in
-        x = self.dense_in(x)  # 先轉換維度到1024
+    def forward(self, x):
         x_in = x
+
         x = self.LayerNorm(x)
         x = self.dropout(self.dense2(self.act_fn(self.dense1(x)))) + x_in
+        # x = self.dense_in(x)  # 先轉換維度到1024
+        # x_in = x
+        # x = self.LayerNorm(x)
+        # x = self.dropout(self.dense2(self.act_fn(self.dense1(x)))) + x_in
 
         return x
     
@@ -152,8 +153,8 @@ class MultiBlipDisenBooth(nn.Module):
         self.vae = AutoencoderKL.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="vae"
         )
-        if args.vae_half_precision:
-            self.vae.half()
+        # if args.vae_half_precision:
+        #     self.vae.half()
 
         self.unet = UNet2DConditionModel.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="unet"
@@ -180,6 +181,9 @@ class MultiBlipDisenBooth(nn.Module):
         ### Load parameters from pretrained BLIP-Diffusion ###
         self.pretrained_BLIPdiffusion_name_or_path = args.pretrained_BLIPdiffusion_name_or_path
         self.load_pretrained_parameters()
+
+    def device(self):
+        return list(self.parameters())[0].device
 
     def freeze_modules(self):
         to_freeze = [self.vae]
@@ -246,10 +250,37 @@ class MultiBlipDisenBooth(nn.Module):
         logging.info("Loading pretrained unet weights.")
         load_state_dict(self.unet, "unet/diffusion_pytorch_model.bin")
 
-             
+    def before_training(self, dataset, **kwargs):
+        # print(dataset)
+        # assert len(dataset) == 1, "Only support single dataset for now."
+
+        # key = list(dataset.keys())[0]
+        # dataset = dataset[key]["train"]
+
+        # collect all examples
+        # [FIXME] this is not memory efficient. may OOM if the dataset is large.
+
+        input_images = dataset["inp_image"].to(self.device())
+        subject_text = dataset["subject_text"]
+
+        # calculate ctx embeddings and cache them
+        ctx_embeddings = self.forward_ctx_embeddings(
+            input_image=input_images, text_input=subject_text
+        )
+        # take mean of all ctx embeddings
+        ctx_embeddings = ctx_embeddings.mean(dim=0, keepdim=True)
+        self.ctx_embeddings_cache = nn.Parameter(ctx_embeddings, requires_grad=True)
+        self._use_embeddings_cache = True
+
+        # free up CUDA memory
+        self.blip.to("cpu")
+        self.proj_layer.to("cpu")
+
+        torch.cuda.empty_cache()
 
     def forward(self, samples):
-        latents = self.vae.encode(samples["tgt_image"].half()).latent_dist.sample()
+        # latents = self.vae.encode(samples["tgt_image"].half()).latent_dist.sample()
+        latents = self.vae.encode(samples["tgt_image"]).latent_dist.sample()
         latents = latents * 0.18215
 
         # Sample noise that we'll add to the latents
@@ -281,7 +312,7 @@ class MultiBlipDisenBooth(nn.Module):
             truncation=True,
             max_length=self.tokenizer.model_max_length,
             return_tensors="pt",
-        ).input_ids.to(self.device)
+        ).input_ids.to(self.device())
 
         encoder_hidden_states = self.text_encoder(
             input_ids=input_ids,
@@ -292,6 +323,7 @@ class MultiBlipDisenBooth(nn.Module):
         ### Identity-irrelevent Branch ###
         # Get the image embedding
         img_embeddings = self.img_encoder.encode_image( self.clip_trans(samples["inp_image"]) ).unsqueeze(1)
+        img_embeddings.mean(dim=0, keepdim=True)
         img_state = self.img_adapter( img_embeddings )
 
         # Predict the noise residual
@@ -319,6 +351,7 @@ class MultiBlipDisenBooth(nn.Module):
         loss_aux1 = F.mse_loss(id_irrel_pred.float(), target.float(), reduction="mean")
         loss_aux2 = cal_cos(encoder_hidden_states, img_state, self.cos)
         loss = loss + 0.01*loss_aux1 + 0.001*loss_aux2
+        # loss = loss + 0.01*loss_aux2
 
         return { "loss": loss }
         
