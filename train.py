@@ -59,7 +59,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from lavis.models.blip2_models.blip2_qformer import Blip2Qformer
 from lavis.models.blip_diffusion_models.modeling_ctx_clip import CtxCLIPTextModel
 from multi_BD import MultiBlipDisenBooth
-from dataset import SubjectDrivenTextToImageDataset
+from dataset import SubjectDrivenTextToImageDataset, collate_fn
 from transformers.activations import QuickGELUActivation as QuickGELU
 from utils import parse_args
 
@@ -147,7 +147,7 @@ def train(args):
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             import xformers
-
+            logging.info("Using xformers.")
             xformers_version = version.parse(xformers.__version__)
             if xformers_version == version.parse("0.0.16"):
                 logger.warn(
@@ -209,7 +209,136 @@ def train(args):
         text_prompt=args.text_prompt,
     )
 
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size = args.train_batch_size,
+        shuffle = True,
+        collate_fn = lambda samples: collate_fn(samples),
+        num_workers=args.dataloader_num_workers,
+    )
+
+    # Scheduler and math around the number of training steps.
+    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        overrode_max_train_steps = True
+
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
+        num_training_steps=args.max_train_steps * accelerator.num_processes,
+        num_cycles=args.lr_num_cycles,
+        power=args.lr_power,
+    )
+
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler
+    )
     
+    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if overrode_max_train_steps:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    # Afterwards we recalculate our number of training epochs
+    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+    # We need to initialize the trackers we use, and also store our configuration.
+    # The trackers initializes automatically on the main process.
+    if accelerator.is_main_process:
+        tracker_config = vars(copy.deepcopy(args))
+        tracker_config.pop("validation_images")
+        accelerator.init_trackers(
+            project_name="BLIP-DisenBooth",
+            config=tracker_config
+        )
+    
+    # Train!
+    # for name, param in model.named_parameters():
+    #     if param.requires_grad:
+    #         logger.info(f"Trainable parameter: {name} with shape {param.shape}")
+
+    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+
+    logger.info("\n***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
+    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    global_step = 0
+    first_epoch = 0
+    # Potentially load in the weights and states from a previous save
+
+    initial_global_step = 0
+    cos = nn.CosineSimilarity(dim=1, eps=1e-6)
+
+    progress_bar = tqdm(
+        range(global_step, args.max_train_steps),
+        initial=initial_global_step,
+        desc="Steps",
+        # Only show the progress bar once on each machine.
+        disable=not accelerator.is_local_main_process,
+    )
+
+    for epoch in range(first_epoch, args.num_train_epochs):
+        model.train()
+        train_loss = 0.0
+        for step, batch in enumerate(train_dataloader):
+            progress_bar.set_description("Global step: {}".format(global_step))
+
+            with accelerator.accumulate(model), torch.backends.cuda.sdp_kernel(
+                enable_flash=not args.disable_flashattention
+            ):
+                # if step == 0:
+                #     model.before_training(model=model,
+                #                           dataset=batch
+                #                           )
+                return_dict = model(batch)
+                loss = return_dict['loss']
+
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    params_to_clip = (
+                        unet_params + proj_layer_params + img_adapter_params +text_encoder_params
+                        if args.train_text_encoder
+                        else unet_params + proj_layer_params + img_adapter_params
+                    )
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+
+                if accelerator.is_main_process:
+                    if global_step % args.checkpointing_steps == 0:
+                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        accelerator.save_state(save_path)
+                        logger.info(f"Saved state to {save_path}")
+            
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs)
+            accelerator.log(logs, step=global_step)
+
+            if global_step >= args.max_train_steps:
+                break
+    
+    # Save the every layers
+    accelerator.wait_for_everyone()
+    # if accelerator.is_main_process:
+    #     model = accelerator.unwrap_model(model)
+
+    #     pipeline = model.to_pipeline()
+    #     pipeline.save_pretrained(args.output_dir)
+    accelerator.end_training()
 
 if __name__ == "__main__":
     args = parse_args()
