@@ -250,7 +250,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=0,
+        default=1,
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
@@ -330,6 +330,7 @@ def parse_args(input_args=None):
     )
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", 
+        default=True,
         action="store_true", 
         help="Whether or not to use xformers."
     )
@@ -370,6 +371,7 @@ def parse_args(input_args=None):
         default=4,
         help=("The dimension of the LoRA update matrices."),
     )
+    parser.add_argument("--disable_flashattention", default=False, action="store_true")
 
     if input_args is not None:
         args = parser.parse_args(input_args)
