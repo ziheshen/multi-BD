@@ -2,7 +2,7 @@ import argparse
 import warnings
 import os
 
-def parse_args(input_args=None):
+def train_parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
         "--pretrained_model_name_or_path",
@@ -398,3 +398,41 @@ def parse_args(input_args=None):
         raise ValueError("`--train_text_encoder` cannot be used with `--pre_compute_text_embeddings`")
 
     return args
+
+def infer_parse_args(input_args=None):
+    parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    
+    parser.add_argument(
+        "--finetuned_ckpt",
+        type=str,
+        default=None,
+        required=True,
+        help="",
+    )
+    parser.add_argument(
+        "--pretrained_model_name_or_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--pretrained_BLIPdiffusion_name_or_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained BLIP-Diffusion model or download from https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP-Diffusion/blip-diffusion.tar.gz.",
+    )
+    parser.add_argument(
+        "--subject_text",
+        type=str,
+        default=None,
+        required=True,
+        help="The prompt with identifier specifying the instance",
+    )
+    parser.add_argument(
+        "--text_prompt",
+        type=str,
+        default=None,
+        help="Text prompt for model inference."
+    )
