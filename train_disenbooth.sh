@@ -2,7 +2,7 @@
 export MODEL_NAME="runwayml/stable-diffusion-v1-5"
 export PRETRAINED_BLIP_DIFFUSION="https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP-Diffusion/blip-diffusion.tar.gz"
 export INSTANCE_DIR="/LAVIS/data/mit_mascot"
-export OUTPUT_DIR="./output/with_without_irrel"
+export OUTPUT_DIR="./output/with_irrel"
 
 accelerate launch train.py \
   --pretrained_model_name_or_path=$MODEL_NAME  \
@@ -10,6 +10,7 @@ accelerate launch train.py \
   --instance_data_dir=$INSTANCE_DIR \
   --output_dir=$OUTPUT_DIR \
   --subject_text="mit_mascot" \
+  --text_prompt="mit_mascot" \
   --resolution=512 \
   --train_batch_size=1 \
   --gradient_accumulation_steps=1 \
