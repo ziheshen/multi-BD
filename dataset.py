@@ -9,11 +9,12 @@ import os
 
 from PIL import Image
 from pathlib import Path
+import torch
 from torch.utils.data import Dataset
 from torch.utils.data.dataloader import default_collate
 from torchvision import transforms
 from torchvision.transforms.functional import InterpolationMode
-from processors import input_image_precesser, target_image_processer, text_proceesser
+from processers import BlipDiffusionInputImageProcessor, BlipDiffusionTargetImageProcessor, text_proceesser
 
 
 class SubjectDrivenTextToImageDataset(Dataset):
@@ -22,18 +23,18 @@ class SubjectDrivenTextToImageDataset(Dataset):
         image_dir,
         subject_text,
         text_prompt,
-        repetition=100000,
+        repetition=10,
     ):
         self.subject = text_proceesser(subject_text.lower())
         self.image_dir = image_dir
 
-        self.inp_image_transform = input_image_precesser()
-        self.tgt_image_transform = target_image_processer()
+        self.inp_image_transform = BlipDiffusionInputImageProcessor()
+        self.tgt_image_transform = BlipDiffusionTargetImageProcessor()
 
 
         image_paths = os.listdir(image_dir)
-        if not Path(image_paths).exists():
-            raise ValueError("Images root doesn't exists.")
+        # if not Path(image_paths).exists():
+        #     raise ValueError("Images root doesn't exists.")
         # image paths are jpg png webp
         image_paths = [
             os.path.join(image_dir, imp)
@@ -51,9 +52,6 @@ class SubjectDrivenTextToImageDataset(Dataset):
     @property
     def len_without_repeat(self):
         return len(self.image_paths)
-
-    def collater(self, samples):
-        return default_collate(samples)
 
     def __getitem__(self, index):
         image_path = self.image_paths[index % len(self.image_paths)]
@@ -73,4 +71,17 @@ class SubjectDrivenTextToImageDataset(Dataset):
             "caption": caption,
             "subject_text": self.subject,
         }
-    
+
+def collate_fn(samples):
+    samples = [s for s in samples if s is not None]
+    # Check if samples is empty after filtering
+    if not samples:
+        return {}
+    collated_dict = {}
+    keys = samples[0].keys() # Use the keys of the first sample as a reference
+    for k in keys:
+        values = [sample[k] for sample in samples]
+        # If the value type for the key is torch.Tensor, stack them else return list
+        collated_dict[k] = torch.stack(values, dim=0) if isinstance(values[0], torch.Tensor) else values
+    return collated_dict
+
