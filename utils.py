@@ -26,13 +26,6 @@ def train_parse_args(input_args=None):
         help="A folder containing the training data of instance images.",
     )
     parser.add_argument(
-        "--class_data_dir",
-        type=str,
-        default=None,
-        required=False,
-        help="A folder containing the training data of class images.",
-    )
-    parser.add_argument(
         "--subject_text",
         type=str,
         default=None,
@@ -44,12 +37,6 @@ def train_parse_args(input_args=None):
         type=str,
         default=None,
         help="Text prompt for model inference."
-    )
-    parser.add_argument(
-        "--class_prompt",
-        type=str,
-        default=None,
-        help="The prompt to specify images in the same class as provided instance images.",
     )
     parser.add_argument(
         "--validation_prompt",
@@ -110,7 +97,7 @@ def train_parse_args(input_args=None):
     )
     parser.add_argument(
         "--proj_train",
-        default=True,
+        default=False,
         action="store_true",
         help="Flag to indicate whether to train the projection layer."
     )
@@ -127,20 +114,10 @@ def train_parse_args(input_args=None):
         help="Flag to indicate whether to train the image encoder."
     )
     parser.add_argument(
-        "--with_prior_preservation",
-        default=False,
+        "--use_irrel_branch",
+        default=True,
         action="store_true",
-        help="Flag to add prior preservation loss.",
-    )
-    parser.add_argument("--prior_loss_weight", type=float, default=1.0, help="The weight of prior preservation loss.")
-    parser.add_argument(
-        "--num_class_images",
-        type=int,
-        default=100,
-        help=(
-            "Minimal class images for prior preservation loss. If there are not enough images already present in"
-            " class_data_dir, additional images will be sampled with class_prompt."
-        ),
+        help="Whether or not use the irrelevent bench for training."
     )
     parser.add_argument(
         "--output_dir",
@@ -156,15 +133,6 @@ def train_parse_args(input_args=None):
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
-        ),
-    )
-    parser.add_argument(
-        "--center_crop",
-        default=False,
-        action="store_true",
-        help=(
-            "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
-            " cropped. The images will be resized to the resolution first before cropping."
         ),
     )
     parser.add_argument(
@@ -213,6 +181,7 @@ def train_parse_args(input_args=None):
     )
     parser.add_argument(
         "--gradient_checkpointing",
+        # default=True,
         action="store_true",
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
     )
@@ -382,18 +351,6 @@ def train_parse_args(input_args=None):
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    if args.with_prior_preservation:
-        if args.class_data_dir is None:
-            raise ValueError("You must specify a data directory for class images.")
-        if args.class_prompt is None:
-            raise ValueError("You must specify prompt for class images.")
-    else:
-        # logger is not available yet
-        if args.class_data_dir is not None:
-            warnings.warn("You need not use --class_data_dir without --with_prior_preservation.")
-        if args.class_prompt is not None:
-            warnings.warn("You need not use --class_prompt without --with_prior_preservation.")
-
     if args.train_text_encoder and args.pre_compute_text_embeddings:
         raise ValueError("`--train_text_encoder` cannot be used with `--pre_compute_text_embeddings`")
 
@@ -402,13 +359,6 @@ def train_parse_args(input_args=None):
 def infer_parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     
-    parser.add_argument(
-        "--finetuned_ckpt",
-        type=str,
-        default=None,
-        required=True,
-        help="",
-    )
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
@@ -424,7 +374,21 @@ def infer_parse_args(input_args=None):
         help="Path to pretrained BLIP-Diffusion model or download from https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP-Diffusion/blip-diffusion.tar.gz.",
     )
     parser.add_argument(
-        "--subject_text",
+        "--finetuned_ckpt",
+        type=str,
+        default="/LAVIS/multi_BlipDisenBooth/output/with_irrel/checkpoint-200",
+        required=False,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--cond_subject",
+        type=str,
+        default=None,
+        required=True,
+        help="The prompt with identifier specifying the instance",
+    )
+    parser.add_argument(
+        "--tgt_subject",
         type=str,
         default=None,
         required=True,
@@ -436,3 +400,76 @@ def infer_parse_args(input_args=None):
         default=None,
         help="Text prompt for model inference."
     )
+    parser.add_argument(
+        "--qformer_num_query_token",
+        type=int,
+        default=16,
+        help="Number of query tokens for Q-Former model."
+    )
+    parser.add_argument(
+        "--qformer_cross_attention_freq",
+        type=int,
+        default=1,
+        help="Frequency of cross attention layers in Q-Former model."
+    )
+    parser.add_argument(
+        "--qformer_pretrained_path",
+        type=str,
+        default=None,
+        help="Path to the pretrained Q-Former model, if any."
+    )
+    parser.add_argument(
+        "--qformer_train",
+        default=False,
+        action="store_true",
+        help="Flag to indicate whether to train the Q-Former model."
+    )    
+    parser.add_argument(
+        "--train_text_encoder",
+        default=False,
+        action="store_true",
+        help="Flag to indicate whether to train the text encoder."
+    )
+    parser.add_argument(
+        "--vae_half_precision",
+        default=True,
+        action="store_true",
+        help="Flag to use half precision for VAE model."
+    )
+    parser.add_argument(
+        "--proj_train",
+        default=False,
+        action="store_true",
+        help="Flag to indicate whether to train the projection layer."
+    )
+    parser.add_argument(
+        "--img_adapter_train",
+        default=False,
+        action="store_true",
+        help="Flag to indicate whether to train the image adapter."
+    )
+    parser.add_argument(
+        "--img_encoder_train",
+        default=False,
+        action="store_true",
+        help="Flag to indicate whether to train the image encoder."
+    )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=1024,
+        help=(
+            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
+            " resolution"
+        ),
+    )
+    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+
+
+    if input_args is not None:
+        # print("FUCK")
+        args = parser.parse_args(input_args)
+    else:
+        args = parser.parse_args()
+        
+    return args
