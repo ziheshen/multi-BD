@@ -1,4 +1,5 @@
 output
+infer_logs
 logs
 .ipynb_checkpoints
 __pycache__
