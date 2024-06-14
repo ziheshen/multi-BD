@@ -19,20 +19,11 @@ from diffusers import (
     PNDMScheduler,
     UNet2DConditionModel,
 )
-# from diffusers.loaders import (
-#     LoraLoaderMixin,
-#     text_encoder_lora_state_dict,
-# )
 from diffusers.models.attention_processor import (
     AttnAddedKVProcessor,
     AttnAddedKVProcessor2_0,
     SlicedAttnAddedKVProcessor,
 )
-# from diffusers.models.lora import LoRALinearLayer
-# from diffusers.optimization import get_scheduler
-# from diffusers.training_utils import unet_lora_state_dict
-# from diffusers.utils import check_min_version, is_wandb_available
-# from diffusers.utils.import_utils import is_xformers_available
 
 from lavis.models.blip2_models.blip2_qformer import Blip2Qformer
 from lavis.models.blip_diffusion_models.modeling_ctx_clip import CtxCLIPTextModel
@@ -42,7 +33,11 @@ from lavis.models.blip_diffusion_models.ptp_utils import (
     P2PCrossAttnProcessor,
     AttentionRefine,
 )
+from lavis.models.blip_diffusion_models.utils import numpy_to_pil
+from lavis.common.dist_utils import download_cached_file
 from transformers.activations import QuickGELUActivation as QuickGELU
+
+from safetensors.torch import load_file
 
 class ProjLayer(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim, drop_p=0.1, eps=1e-12):
@@ -56,49 +51,41 @@ class ProjLayer(nn.Module):
 
         self.LayerNorm = nn.LayerNorm(out_dim, eps=eps)
 
-        # self.dense_in = nn.Linear(in_dim, out_dim)
-        # self.dense1 = nn.Linear(out_dim, hidden_dim)
-        # self.act_fn = QuickGELU()
-        # self.dense2 = nn.Linear(hidden_dim, out_dim)
-        # self.dropout = nn.Dropout(drop_p)
-        # self.LayerNorm = nn.LayerNorm(out_dim, eps=eps)
-
     def forward(self, x):
         x_in = x
 
         x = self.LayerNorm(x)
         x = self.dropout(self.dense2(self.act_fn(self.dense1(x)))) + x_in
-        # x = self.dense_in(x)  # 先轉換維度到1024
-        # x_in = x
-        # x = self.LayerNorm(x)
-        # x = self.dropout(self.dense2(self.act_fn(self.dense1(x)))) + x_in
 
         return x
     
 class MultiBlipDisenBooth(nn.Module):
     def __init__(
-        self, args,
+        self,
+        args,
+        subject_text="",
+        text_prompt="",
         qformer_num_query_token=16,
         qformer_cross_attention_freq=1,
         qformer_pretrained_path=None,
         qformer_train=False,
-        pretrained_model_name_or_path="stabilityai/stable-diffusion-2-1-base",
+        pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5",
+        pretrained_BLIPdiffusion_name_or_path="https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP-Diffusion/blip-diffusion.tar.gz",
         train_text_encoder=False,
         vae_half_precision=True,
-        proj_train=True,
+        proj_train=False,
         img_adapter_train=True,
         img_encoder_train=False,
-        subject_text="",
-        text_prompt="",
         id_rel_weight = 1.0,
         id_irrel_weight = 1.0,
+        use_irrel_branch=True
     ):
         super().__init__()
         
         ### Identity-relevent Branch ###
         # BLIP2 QFormer
         self.num_query_token = args.qformer_num_query_token
-        self.subject_text = args.validation_prompt
+        # self.subject_text = args.validation_prompt
         
 
         self.blip = Blip2Qformer(
@@ -129,20 +116,20 @@ class MultiBlipDisenBooth(nn.Module):
         self.proj_train = args.proj_train
 
         # Text Encoder
-        self.text_prompt = args.text_prompt
+        # self.text_prompt = args.text_prompt
 
-        self.tokenizer = CLIPTokenizer.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="tokenizer"
-        )
+        # self.tokenizer = CLIPTokenizer.from_pretrained(
+        #     pretrained_model_name_or_path, subfolder="tokenizer"
+        # )
         self.text_encoder = CtxCLIPTextModel.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="text_encoder"
+            pretrained_model_name_or_path, subfolder="text_encoder"
         )
 
         # self.id_rel_weight = args.id_rel_weight
 
         ### Identity-irrelevent Branch ###
         # Image Encoder
-        self.img_encoder, _, _ = open_clip.create_model_and_transforms('ViT-H-14', pretrained='laion2b_s32b_b79k')
+        self.img_encoder, _, self.preprocess = open_clip.create_model_and_transforms('ViT-H-14', pretrained='laion2b_s32b_b79k')
         self.clip_trans = transforms.Resize( (224, 224), interpolation=transforms.InterpolationMode.BILINEAR )
         
         self.img_encoder_train = args.img_encoder_train
@@ -284,10 +271,15 @@ class MultiBlipDisenBooth(nn.Module):
 
         # collect all examples
         # [FIXME] this is not memory efficient. may OOM if the dataset is large.
-
-        input_images = dataset["inp_image"].to(self.device())
-        subject_text = dataset["subject_text"]
-
+        examples = [dataset[i] for i in range(dataset.len_without_repeat)]
+        # print(examples)
+        input_images = (
+            torch.stack([example["inp_image"] for example in examples])
+            .to(memory_format=torch.contiguous_format)
+            .float()
+        ).to(self.device())
+        subject_text = [dataset.subject for _ in range(input_images.shape[0])]
+        
         # calculate ctx embeddings and cache them
         ctx_embeddings = self.forward_ctx_embeddings(
             input_image=input_images, text_input=subject_text
@@ -320,7 +312,7 @@ class MultiBlipDisenBooth(nn.Module):
         )
         timesteps = timesteps.long()
 
-        ### Identity-irrelevent Branch ###
+        ### Identity-relevent Branch ###
         # Add noise to the latents according to the noise magnitude at each timestep
         # (this is the forward diffusion process)
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
@@ -331,18 +323,11 @@ class MultiBlipDisenBooth(nn.Module):
         )
 
         # Get the text embedding for conditioning
-        input_ids = self.tokenizer(
-            samples["caption"],
-            padding="do_not_pad",
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
-        ).input_ids.to(self.device())
-
         encoder_hidden_states = self.text_encoder(
-            input_ids=input_ids,
+            input_ids=samples["caption_ids"],
+            # input_ids=input_ids,
             ctx_embeddings=ctx_embeddings,
-            ctx_begin_pos=[self._CTX_BEGIN_POS] * input_ids.shape[0],
+            ctx_begin_pos=[self._CTX_BEGIN_POS] * samples["caption_ids"].shape[0],
         )[0]
 
         ### Identity-irrelevent Branch ###
@@ -375,7 +360,8 @@ class MultiBlipDisenBooth(nn.Module):
         loss = F.mse_loss(id_rel_pred.float(), target.float(), reduction="mean")
         loss_aux1 = F.mse_loss(id_irrel_pred.float(), target.float(), reduction="mean")
         loss_aux2 = cal_cos(encoder_hidden_states, img_state, self.cos)
-        loss = loss + 0.01*loss_aux1 + 0.001*loss_aux2
+        loss = loss + 1*loss_aux1 + 1*loss_aux2
+        # loss = loss + 0.01*loss_aux1 + 0.001*loss_aux2
         # loss = loss + 0.01*loss_aux2
 
         return { "loss": loss }
@@ -443,12 +429,20 @@ class MultiBlipDisenBooth(nn.Module):
         if controller is not None:
             self._register_attention_refine(controller)
         
+        ref_image = samples["ref_images"]
         cond_image = samples["cond_images"]  # reference image
         cond_subject = samples["cond_subject"]  # source subject category
         tgt_subject = samples["tgt_subject"]  # target subject category
         prompt = samples["prompt"]
         cldm_cond_image = samples.get("cldm_cond_image", None)  # conditional image
 
+        ref_img = self.preprocess(ref_image).unsqueeze(0).to("cuda")
+        img_feature = self.img_encoder.encode_image( ref_img ).unsqueeze(1) 
+        if self.img_adapter is not None:
+            img_feature = self.img_adapter(img_feature)
+        img_feature = torch.cat([torch.zeros_like(img_feature),img_feature])
+
+        # cond_image = None
         prompt = self._build_prompt(
             prompts=prompt,
             tgt_subjects=tgt_subject,
@@ -458,12 +452,7 @@ class MultiBlipDisenBooth(nn.Module):
 
         text_embeddings = self._forward_prompt_embeddings(
             cond_image, cond_subject, prompt
-        )
-
-        img_feature = self.img_encoder.encode_image( cond_image ).unsqueeze(1) 
-        if self.img_adapter is not None:
-            img_feature = self.img_adapter(img_feature)
-        img_feature = torch.cat([torch.zeros_like(img_feature),img_feature])
+        )        
 
         # 3. unconditional embedding
         do_classifier_free_guidance = guidance_scale > 1.0
@@ -484,9 +473,9 @@ class MultiBlipDisenBooth(nn.Module):
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
-            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+            text_embeddings = torch.cat([text_embeddings, ])
         
-        prompt_embeds = text_weight*prompt_embeds + image_weight*img_feature
+        prompt_embeds = text_weight*text_embeddings + image_weight*img_feature
 
         if seed is not None:
             generator = torch.Generator(device=self.device())
@@ -506,7 +495,7 @@ class MultiBlipDisenBooth(nn.Module):
             latents = self._denoise_latent_step(
                 latents=latents,
                 t=t,
-                text_embeddings=text_embeddings,
+                text_embeddings=prompt_embeds,
                 cond_image=cldm_cond_image,
                 height=height,
                 width=width,
@@ -583,7 +572,7 @@ class MultiBlipDisenBooth(nn.Module):
         self_replace_steps=0.4,
         threshold=0.3,
     ):
-        device, tokenizer = self.device, self.tokenizer
+        device, tokenizer = self.device(), self.tokenizer
 
         lb = LocalBlend(
             prompts=prompts,
@@ -616,12 +605,29 @@ class MultiBlipDisenBooth(nn.Module):
 
         return rv
     
+    def _tokenize_text(self, text_input, with_query=True):
+        max_len = self.text_encoder.text_model.config.max_position_embeddings
+        if with_query:
+            max_len -= self.num_query_token
+        self.tokenizer = CLIPTokenizer.from_pretrained(
+            "runwayml/stable-diffusion-v1-5", subfolder="tokenizer"
+        )
+        tokenized_text = self.tokenizer(
+            text_input,
+            padding="max_length",
+            truncation=True,
+            max_length=max_len,
+            return_tensors="pt",
+        )
+
+        return tokenized_text
+    
     def _forward_prompt_embeddings(self, input_image, src_subject, prompt):
         # 1. extract BLIP query features and proj to text space -> (bs, 32, 768)
-        query_embeds = self.forward_ctx_embeddings(input_image, src_subject)
+        query_embeds = self.forward_ctx_embeddings(input_image, src_subject).to(self.device())
 
         # 2. embeddings for prompt, with query_embeds as context
-        tokenized_prompt = self._tokenize_text(prompt).to(self.device)
+        tokenized_prompt = self._tokenize_text(prompt).to(self.device())
         text_embeddings = self.text_encoder(
             input_ids=tokenized_prompt.input_ids,
             ctx_embeddings=query_embeds,
@@ -643,7 +649,7 @@ class MultiBlipDisenBooth(nn.Module):
             height // 8,
             width // 8,
         )
-        return latent.to(self.device)
+        return latent.to(self.device())
     
     def _predict_noise(
         self,
@@ -692,3 +698,43 @@ class MultiBlipDisenBooth(nn.Module):
         image = numpy_to_pil(image)
 
         return image
+    
+    def load_checkpoint(self, url_or_filename):
+        """
+        Used to load finetuned models.
+        """
+        # print("self.ctx_embeddings_cache: ",self.ctx_embeddings_cache)
+        self._load_checkpoint(url_or_filename)
+
+        # print("loading fine-tuned model from {}".format(url_or_filename))
+        self._use_embeddings_cache = True
+        # print("self.ctx_embeddings_cache: ",self.ctx_embeddings_cache)
+
+
+    def _load_checkpoint(self, url_or_filename):
+        """
+        Load from a finetuned checkpoint.
+
+        This should expect no mismatch in the model keys and the checkpoint keys.
+        """
+
+        if is_url(url_or_filename):
+            cached_file = download_cached_file(
+                url_or_filename, check_hash=False, progress=True
+            )
+            checkpoint = torch.load(cached_file, map_location="cpu")
+        elif os.path.isfile(url_or_filename):
+            checkpoint = load_file(url_or_filename, device="cpu")
+        else:
+            raise RuntimeError("checkpoint url or path is invalid")
+
+        if "model" in checkpoint.keys():
+            state_dict = checkpoint["model"]
+        else:
+            state_dict = checkpoint
+        msg = self.load_state_dict(state_dict, strict=False)
+
+        logging.info("Missing keys {}".format(msg.missing_keys))
+        logging.info("load checkpoint from %s" % url_or_filename)
+
+        return msg
