@@ -23,8 +23,11 @@ class SubjectDrivenTextToImageDataset(Dataset):
         image_dir,
         subject_text,
         text_prompt,
-        repetition=10,
+        text_tokenizer,
+        repetition=100000,
     ):
+        self.text_tokenizer = text_tokenizer
+
         self.subject = text_proceesser(subject_text.lower())
         self.image_dir = image_dir
 
@@ -61,15 +64,22 @@ class SubjectDrivenTextToImageDataset(Dataset):
         # maybe worth trying different captions for different images
         caption = f"a {self.subject}"
         caption = text_proceesser(caption)
+        caption_ids = self.text_tokenizer(
+            caption[0],
+            padding="do_not_pad",
+            truncation=True,
+            max_length=self.text_tokenizer.model_max_length,
+            return_tensors="pt",
+        ).input_ids.squeeze(0)
 
         inp_image = self.inp_image_transform(image)
         tgt_image = self.tgt_image_transform(image)
-
+        # print(caption_ids)
         return {
             "inp_image": inp_image,
             "tgt_image": tgt_image,
-            "caption": caption,
             "subject_text": self.subject,
+            "caption_ids": caption_ids,            
         }
 
 def collate_fn(samples):
